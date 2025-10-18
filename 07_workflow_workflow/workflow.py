@@ -16,36 +16,53 @@ Workflow Steps:
 """
 
 import asyncio
+from email.mime import image
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import mimetypes
+from dotenv import load_dotenv
 
 from agent_framework import (
     Case,
+    ChatMessage,
     Default,
     Executor,
+    TextContent,
+    UriContent,
     WorkflowBuilder,
     WorkflowContext,
     handler,
 )
+from agent_framework.openai import OpenAIResponsesClient
+
 from pydantic import BaseModel, Field
 from typing_extensions import Never
 
+import os
+from pathlib import Path
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient, PublicAccess, ContentSettings
+from azure.core.exceptions import ResourceExistsError
+
 
 @dataclass
-class EmailContent:
+class WorkflowContent:
     """A data class to hold the processed email content."""
 
     original_message: str
+    input_path: str
+    is_image: bool
     cleaned_message: str
     word_count: int
     has_suspicious_patterns: bool = False
+
 
 
 @dataclass
 class ContentAnalysis:
     """A data class to hold content analysis results."""
 
-    email_content: EmailContent
+    email_content: WorkflowContent
     sentiment_score: float
     contains_links: bool
     has_attachments: bool
@@ -78,38 +95,86 @@ class ProcessingResult:
     is_spam: bool
     confidence_score: float
     spam_reasons: list[str]
+    input_path: str
+    is_image: bool
 
 
-class EmailRequest(BaseModel):
+@dataclass
+class BlobUploadResult:
+    """A data class to hold blob upload results."""
+
+    blob_url: str
+    blob_name: str
+    container_name: str
+    content_type: str
+    upload_timestamp: str
+    file_size_bytes: int
+    original_path: str
+
+
+
+
+
+class WorkflowRequest(BaseModel):
     """Request model for email processing."""
 
-    email: str = Field(
-        description="The email message to be processed.",
-        default="Hi there, are you interested in our new urgent offer today? Click here!",
+    path: str = Field(
+        description="The file path to be processed",
+        default="test_image_01.png",
     )
 
 
-class EmailPreprocessor(Executor):
-    """Step 1: An executor that preprocesses and cleans email content."""
+class InputPreprocessor(Executor):
+    """Step 1: An executor that preprocesses input content"""
 
     @handler
-    async def handle_email(self, email: EmailRequest, ctx: WorkflowContext[EmailContent]) -> None:
-        """Clean and preprocess the email message."""
+    async def handle_workflow_request(self, workflowRequest: WorkflowRequest, ctx: WorkflowContext[WorkflowContent]) -> None:
+        """Preprocess the workflow request"""
+        logging.info(f"InputPreprocessor: Processing request")
+        logging.debug(f"  Path: {workflowRequest.path}")
+        
         await asyncio.sleep(1.5)  # Simulate preprocessing time
 
+        # Check if file exists and is a common image type
+        
+        file_path = Path(workflowRequest.path)
+        is_image = False
+        
+        if file_path.exists() and file_path.is_file():
+            # Check for common image extensions
+            common_image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.tiff', '.tif'}
+            is_image = file_path.suffix.lower() in common_image_extensions
+            logging.info(f"  File exists: {file_path}")
+            logging.info(f"  Extension: {file_path.suffix}")
+            logging.info(f"  Is image: {is_image}")
+        else:
+            # File doesn't exist or is not a file
+            logging.warning(f"  File not found or not a file: {file_path}")
+            await ctx.send_message(WorkflowContent(
+                original_message=workflowRequest.path,
+                cleaned_message="",
+                word_count=0,
+                has_suspicious_patterns=False,
+                input_path=workflowRequest.path,
+                is_image=False,
+            ))
+            return
+        
         # Simulate email cleaning
-        cleaned = email.email.strip().lower()
-        word_count = len(email.email.split())
+        cleaned = workflowRequest.path.strip().lower()
+        word_count = len(workflowRequest.path.split())
 
         # Check for suspicious patterns
         suspicious_patterns = ["urgent", "limited time", "act now", "free money"]
         has_suspicious = any(pattern in cleaned for pattern in suspicious_patterns)
 
-        result = EmailContent(
-            original_message=email.email,
+        result = WorkflowContent(
+            original_message=cleaned,
             cleaned_message=cleaned,
             word_count=word_count,
             has_suspicious_patterns=has_suspicious,
+            is_image=is_image,
+            input_path=workflowRequest.path
         )
 
         await ctx.send_message(result)
@@ -119,7 +184,7 @@ class ContentAnalyzer(Executor):
     """Step 2: An executor that analyzes email content and structure."""
 
     @handler
-    async def handle_email_content(self, email_content: EmailContent, ctx: WorkflowContext[ContentAnalysis]) -> None:
+    async def handle_email_content(self, email_content: WorkflowContent, ctx: WorkflowContext[ContentAnalysis]) -> None:
         """Analyze the email content for various indicators."""
         await asyncio.sleep(2.0)  # Simulate analysis time
 
@@ -281,25 +346,240 @@ class FinalProcessor(Executor):
         await ctx.yield_output(completion_message)
 
 
+class BlobStorageUploader(Executor):
+    """An executor that uploads images to Azure Blob Storage with public access."""
+
+    def __init__(self, id: str, connection_string: str | None = None, container_name: str = "images"):
+        """Initialize the executor with Azure Blob Storage settings.
+        
+        Args:
+            id: Executor ID
+            connection_string: Azure Storage connection string (if None, uses env var AZURE_STORAGE_CONNECTION_STRING)
+            container_name: Name of the blob container (default: "images")
+        """
+        super().__init__(id=id)
+        load_dotenv()
+        self._connection_string = connection_string or os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        self._container_name = container_name
+        
+        if not self._connection_string:
+            raise ValueError(
+                "Azure Storage connection string not provided. "
+                "Set AZURE_STORAGE_CONNECTION_STRING environment variable or pass connection_string parameter."
+            )
+
+    @handler
+    async def handle_email_content(
+        self, 
+        email_content: WorkflowContent, 
+        ctx: WorkflowContext[BlobUploadResult]
+    ) -> None:
+        """Upload the image to Azure Blob Storage and return the public URL."""
+        
+        logging.info(f"BlobStorageUploader: Starting upload process")
+        logging.debug(f"  Input path: {email_content.input_path}")
+        logging.debug(f"  Is image: {email_content.is_image}")
+        
+        if not email_content.is_image:
+            raise RuntimeError("Content is not an image, cannot upload to blob storage.")
+        
+        input_path = Path(email_content.input_path)
+        
+        if not input_path.exists():
+            raise FileNotFoundError(f"Image file not found: {input_path}")
+        
+        logging.info(f"  File exists: {input_path} ({input_path.stat().st_size} bytes)")
+        
+        # Create BlobServiceClient
+        logging.debug(f"  Creating BlobServiceClient...")
+        blob_service_client = BlobServiceClient.from_connection_string(self._connection_string)
+        logging.debug(f"  BlobServiceClient created successfully")
+        
+        # Get or create container with public access for blobs
+        container_client = blob_service_client.get_container_client(self._container_name)
+        logging.debug(f"  Container client obtained for '{self._container_name}'")
+        
+        # Check if container exists, create if it doesn't
+        try:
+            # Try to get container properties to check if it exists
+            logging.debug(f"  Checking if container exists...")
+            container_client.get_container_properties()
+            logging.info(f"  Using existing container '{self._container_name}'")
+        except Exception as e:
+            # Container doesn't exist, create it
+            logging.info(f"  Container '{self._container_name}' not found, creating it...")
+            logging.debug(f"  Exception: {e}")
+            try:
+                container_client.create_container(public_access=PublicAccess.Blob)
+                logging.info(f"  Created container '{self._container_name}' with public blob access")
+            except ResourceExistsError:
+                # Race condition - container was created between check and create
+                logging.info(f"  Container '{self._container_name}' already exists")
+            except Exception as create_error:
+                logging.error(f"  Failed to create container: {create_error}")
+                raise
+        
+        # Generate unique blob name with timestamp
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        blob_name = f"{timestamp}_{input_path.name}"
+        logging.info(f"  Generated blob name: {blob_name}")
+        
+        # Get content type
+        content_type, _ = mimetypes.guess_type(str(input_path))
+        if not content_type:
+            content_type = "application/octet-stream"
+        logging.debug(f"  Content type: {content_type}")
+        
+        # Upload the file
+        blob_client = container_client.get_blob_client(blob_name)
+        logging.debug(f"  Blob client obtained for '{blob_name}'")
+        
+        file_size = input_path.stat().st_size
+        logging.info(f"  Uploading {file_size:,} bytes...")
+        
+        with open(input_path, "rb") as data:
+            blob_client.upload_blob(
+                data, 
+                overwrite=True,
+                content_settings=ContentSettings(content_type=content_type)
+            )
+        
+        # Get the public URL
+        blob_url = blob_client.url
+        
+        logging.info(f"✓ Successfully uploaded {input_path.name} to Azure Blob Storage")
+        logging.info(f"  Public URL: {blob_url}")
+        
+        result = BlobUploadResult(
+            blob_url=blob_url,
+            blob_name=blob_name,
+            container_name=self._container_name,
+            content_type=content_type,
+            upload_timestamp=datetime.now(timezone.utc).isoformat(),
+            file_size_bytes=file_size,
+            original_path=str(input_path)
+        )
+        
+        await ctx.send_message(result)
+
+
+class ImageAnalyzer(Executor):
+    """An executor that analyzes images using OpenAI."""
+
+    def __init__(self, id: str):
+        """Initialize the executor with an OpenAI agent."""
+        super().__init__(id=id)
+        self._agent = OpenAIResponsesClient().create_agent(
+            name="Image Analyzer Agent",
+            instructions="You are a helpful agent that can analyze images and extract relevant information.",
+        )
+
+    @handler
+    async def handle_blob_upload(self, blob_result: BlobUploadResult, ctx: WorkflowContext[ContentAnalysis]) -> None:
+        """Analyze the uploaded image using its public blob URL."""
+        
+        # Create a message with the image from blob storage
+        user_message = ChatMessage(
+            role="user",
+            contents=[
+                TextContent(text="Please analyze this image and extract relevant information."),
+                UriContent(
+                    uri=blob_result.blob_url,
+                    media_type=blob_result.content_type,
+                ),
+            ],
+        )
+        
+        # Get the agent's response
+        response = await self._agent.run(user_message)
+        
+        logging.info(f"Image analysis complete for {blob_result.blob_name}")
+        logging.info(f"Agent response: {response}")
+        
+        # Create analysis based on agent response
+        # For now, create a placeholder analysis
+        # You can enhance this to parse the agent's response
+        analysis = ContentAnalysis(
+            email_content=WorkflowContent(
+                original_message=blob_result.blob_url,
+                input_path=blob_result.original_path,
+                is_image=True,
+                cleaned_message=f"Image analyzed from blob: {blob_result.blob_url}",
+                word_count=0,
+                has_suspicious_patterns=False,
+            ),
+            sentiment_score=0.8,
+            contains_links=False,
+            has_attachments=True,
+            risk_indicators=["image_content"],
+        )
+
+        await ctx.send_message(analysis)
+
+    @handler
+    async def handle_email_content(self, email_content: WorkflowContent, ctx: WorkflowContext[ContentAnalysis]) -> None:
+        """Analyze the image content using local file path (fallback)."""
+        
+        input_path = email_content.original_message
+        
+        # Create a message with the image
+        user_message = ChatMessage(
+            role="user",
+            contents=[
+                TextContent(text="Please analyze this image and extract relevant information."),
+                UriContent(
+                    uri="https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+                    media_type="image/jpeg",
+                ),
+            ],
+        )
+        
+        # Get the agent's response
+        response = await self._agent.run(user_message)
+        
+        # Create a placeholder analysis
+        analysis = ContentAnalysis(
+            email_content=email_content,
+            sentiment_score=0.5,
+            contains_links=False,
+            has_attachments=False,
+            risk_indicators=["image_content"],
+        )
+
+        await ctx.send_message(analysis)
+
+
 # Create the workflow instance that DevUI can discover
 spam_keywords = ["spam", "advertisement", "offer", "click here", "winner", "congratulations", "urgent"]
 
 # Create all the executors for the 5-step workflow
-email_preprocessor = EmailPreprocessor(id="email_preprocessor")
+input_preprocessor = InputPreprocessor(id="input_preprocessor")
 content_analyzer = ContentAnalyzer(id="content_analyzer")
 spam_detector = SpamDetector(spam_keywords, id="spam_detector")
 spam_handler = SpamHandler(id="spam_handler")
 message_responder = MessageResponder(id="message_responder")
 final_processor = FinalProcessor(id="final_processor")
 
+# Image processing executors
+blob_uploader = BlobStorageUploader(id="blob_uploader", container_name="images")
+image_analyzer = ImageAnalyzer(id="image_analyzer")
+
 # Build the comprehensive 5-step workflow with branching logic
 workflow = (
     WorkflowBuilder(
-        name="Email Spam Detector",
-        description="5-step email classification workflow with spam/legitimate routing",
+        name="Workflow Workflow",
+        description="Workflow to create Agent Framework workflows with Azure Blob Storage image upload",
     )
-    .set_start_executor(email_preprocessor)
-    .add_edge(email_preprocessor, content_analyzer)
+    .set_start_executor(input_preprocessor)
+    .add_switch_case_edge_group(
+        input_preprocessor,
+        [
+            Case(condition=lambda x: x.is_image, target=blob_uploader),
+            Default(target=content_analyzer),
+        ],
+    )
+    .add_edge(blob_uploader, image_analyzer)
+    .add_edge(image_analyzer, spam_detector)
     .add_edge(content_analyzer, spam_detector)
     .add_switch_case_edge_group(
         spam_detector,
@@ -320,13 +600,20 @@ def main():
     """Launch the spam detection workflow in DevUI."""
     from agent_framework.devui import serve
 
-    # Setup logging
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Setup detailed logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
     logger = logging.getLogger(__name__)
 
-    logger.info("Starting Spam Detection Workflow")
+    logger.info("="*60)
+    logger.info("Starting Workflow Workflow with Azure Blob Storage")
+    logger.info("="*60)
     logger.info("Available at: http://localhost:8090")
     logger.info("Entity ID: workflow_spam_detection")
+    logger.info("="*60)
 
     # Launch server with the workflow
     serve(entities=[workflow], port=8090, auto_open=True)
